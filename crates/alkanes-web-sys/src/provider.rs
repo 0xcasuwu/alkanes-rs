@@ -685,8 +685,8 @@ impl WebProvider {
                 None
             };
 
-            // Parse options (from_addresses, change_address, etc.)
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address) = if let Some(opts_json) = &options_json {
+            // Parse options (from_addresses, change_address, ordinals_strategy, mempool_indexer, etc.)
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -705,6 +705,19 @@ impl WebProvider {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                // Parse ordinals_strategy: "exclude" (default), "preserve" (split), or "burn"
+                let ordinals_strat = opts.get("ordinals_strategy")
+                    .and_then(|v| v.as_str())
+                    .map(|s| match s {
+                        "preserve" | "split" => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Preserve,
+                        "burn" => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Burn,
+                        _ => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Exclude,
+                    })
+                    .unwrap_or_default();
+
+                // Parse mempool_indexer: trace inscription state through unconfirmed parent txs
+                let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
+
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                     opts.get("mine_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -713,9 +726,11 @@ impl WebProvider {
                     from_addrs,
                     change_addr,
                     alkanes_change_addr,
+                    ordinals_strat,
+                    mempool_idx,
                 )
             } else {
-                (false, false, true, false, None, None, None)
+                (false, false, true, false, None, None, None, Default::default(), false)
             };
 
             let params = EnhancedExecuteParams {
@@ -731,8 +746,8 @@ impl WebProvider {
                 trace_enabled,
                 mine_enabled,
                 auto_confirm,
-                ordinals_strategy: Default::default(),
-                mempool_indexer: false,
+                ordinals_strategy,
+                mempool_indexer,
             };
 
             provider.execute(params).await
@@ -785,8 +800,8 @@ impl WebProvider {
                 None
             };
 
-            // Parse options
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address) = if let Some(opts_json) = &options_json {
+            // Parse options (from_addresses, change_address, ordinals_strategy, mempool_indexer, etc.)
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -802,6 +817,19 @@ impl WebProvider {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                // Parse ordinals_strategy: "exclude" (default), "preserve" (split), or "burn"
+                let ordinals_strat = opts.get("ordinals_strategy")
+                    .and_then(|v| v.as_str())
+                    .map(|s| match s {
+                        "preserve" | "split" => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Preserve,
+                        "burn" => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Burn,
+                        _ => alkanes_cli_common::alkanes::types::OrdinalsStrategy::Exclude,
+                    })
+                    .unwrap_or_default();
+
+                // Parse mempool_indexer: trace inscription state through unconfirmed parent txs
+                let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
+
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                     opts.get("mine_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -810,9 +838,11 @@ impl WebProvider {
                     from_addrs,
                     change_addr,
                     alkanes_change_addr,
+                    ordinals_strat,
+                    mempool_idx,
                 )
             } else {
-                (false, false, true, false, None, None, None)
+                (false, false, true, false, None, None, None, Default::default(), false)
             };
 
             let params = EnhancedExecuteParams {
@@ -828,8 +858,8 @@ impl WebProvider {
                 trace_enabled,
                 mine_enabled,
                 auto_confirm,
-                ordinals_strategy: Default::default(),
-                mempool_indexer: false,
+                ordinals_strategy,
+                mempool_indexer,
             };
 
             // Use execute_full to handle the complete flow internally

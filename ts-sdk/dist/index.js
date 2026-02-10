@@ -47961,6 +47961,8 @@ var init_provider = __esm({
         if (params.mineEnabled !== void 0) options.mine_enabled = params.mineEnabled;
         if (params.autoConfirm !== void 0) options.auto_confirm = params.autoConfirm;
         if (params.rawOutput !== void 0) options.raw_output = params.rawOutput;
+        if (params.ordinalsStrategy !== void 0) options.ordinals_strategy = params.ordinalsStrategy;
+        if (params.mempoolIndexer !== void 0) options.mempool_indexer = params.mempoolIndexer;
         const optionsJson = Object.keys(options).length > 0 ? JSON.stringify(options) : null;
         const result = await provider.alkanesExecuteFull(
           JSON.stringify(toAddresses),

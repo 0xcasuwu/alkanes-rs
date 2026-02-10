@@ -2466,6 +2466,13 @@ export class AlkanesProvider {
     mineEnabled?: boolean;
     autoConfirm?: boolean;
     rawOutput?: boolean;
+    /** Strategy for handling UTXOs with ordinal inscriptions:
+     *  - 'exclude' (default): fail if inscribed UTXOs must be spent
+     *  - 'preserve': split inscribed UTXOs to protect inscriptions (multi-tx bundle)
+     *  - 'burn': allow spending inscribed UTXOs (destroys inscriptions) */
+    ordinalsStrategy?: 'exclude' | 'preserve' | 'burn';
+    /** Enable mempool indexer to trace inscription state through unconfirmed parent txs */
+    mempoolIndexer?: boolean;
   }): Promise<any> {
     const provider = await this.getProvider();
 
@@ -2487,6 +2494,8 @@ export class AlkanesProvider {
     if (params.mineEnabled !== undefined) options.mine_enabled = params.mineEnabled;
     if (params.autoConfirm !== undefined) options.auto_confirm = params.autoConfirm;
     if (params.rawOutput !== undefined) options.raw_output = params.rawOutput;
+    if (params.ordinalsStrategy !== undefined) options.ordinals_strategy = params.ordinalsStrategy;
+    if (params.mempoolIndexer !== undefined) options.mempool_indexer = params.mempoolIndexer;
 
     const optionsJson = Object.keys(options).length > 0 ? JSON.stringify(options) : null;
 

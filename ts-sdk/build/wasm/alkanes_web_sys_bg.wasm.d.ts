@@ -285,10 +285,10 @@ export const rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: n
 export const rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h0a7dd91174c54ff4: (a: number, b: number) => void;
 export const wasm_bindgen__closure__destroy__h03f08b76343a9cd1: (a: number, b: number) => void;
-export const wasm_bindgen__convert__closures_____invoke__h9ec53513fb78373d: (a: number, b: number) => void;
-export const wasm_bindgen__closure__destroy__h20fe825946d13681: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h18fd4f3472a27029: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__closure__destroy__h7a5e04299cfb8a06: (a: number, b: number) => void;
+export const wasm_bindgen__convert__closures_____invoke__h9ec53513fb78373d: (a: number, b: number) => void;
+export const wasm_bindgen__closure__destroy__h20fe825946d13681: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h7a3782842eea6d83: (a: number, b: number, c: any, d: any) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
