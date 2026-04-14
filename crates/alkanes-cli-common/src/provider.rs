@@ -289,6 +289,7 @@ impl ConcreteProvider {
             qubitcoin_rpc_url: None,
             quzec_rpc_url: None,
             subfrost_api_key: None,
+            qubitcoin_rpc_url: None,
             timeout_seconds: 600,
             jsonrpc_headers,
         };
