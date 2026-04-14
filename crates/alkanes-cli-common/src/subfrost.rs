@@ -185,8 +185,9 @@ pub async fn get_subfrost_address<P: crate::DeezelProvider + ?Sized>(
     // Build the request parcel with the target alkane encoded in calldata
     let parcel = build_get_signer_parcel();
     
-    // Call simulate - the alkane ID doesn't matter for GET_SIGNER since it's encoded in calldata
-    let response = provider.simulate("", &parcel, None).await?;
+    // Call simulate with the frBTC contract ID [32:0] - the target is also encoded in calldata
+    let contract_id = format!("{}:{}", FRBTC_CONTRACT_BLOCK, FRBTC_CONTRACT_TX);
+    let response = provider.simulate(&contract_id, &parcel, None).await?;
     
     // Parse the signer pubkey from JSON response
     let pubkey_bytes = parse_signer_pubkey(&response)?;
