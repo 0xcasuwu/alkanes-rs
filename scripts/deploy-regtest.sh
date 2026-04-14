@@ -664,7 +664,345 @@ main() {
     if [ -f "$WASM_DIR/btc_yt.wasm" ] && [ -s "$WASM_DIR/btc_yt.wasm" ]; then
         deploy_contract "BTC YT Token" "$WASM_DIR/btc_yt.wasm" 71
     fi
-    
+
+    # =========================================================================
+    # Phase 7: EVM / Anvil + frUSD ERC-20 Deployment
+    # =========================================================================
+    # Deployed and verified during regtest e2e testing session (2026-04-14).
+    # frUSD EVM address: 0x9A676e781A523b5d0C0e43731313A708CB607508
+    # Chain ID: 0x7a69 (31337, Anvil regtest)
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 7: EVM / Anvil + frUSD ERC-20"
+    log_info "=========================================="
+    echo ""
+
+    ANVIL_BIN="${FOUNDRY_BIN:-$HOME/.foundry/bin/anvil}"
+    CAST_BIN="${FOUNDRY_BIN:-$HOME/.foundry/bin/cast}"
+    SUBFROST_ERC20_DIR="${SUBFROST_ERC20_DIR:-$HOME/Documents/github/subfrost-erc20}"
+    ANVIL_PORT="${ANVIL_PORT:-8545}"
+
+    # Start Anvil if not already running
+    if ! curl -s -H "Content-Type: application/json" \
+        --data-binary '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+        http://127.0.0.1:$ANVIL_PORT/ > /dev/null 2>&1; then
+        log_info "Starting Anvil on port $ANVIL_PORT..."
+        "$ANVIL_BIN" --host 127.0.0.1 --port $ANVIL_PORT > /tmp/anvil.log 2>&1 &
+        ANVIL_PID=$!
+        log_success "Anvil started (PID $ANVIL_PID)"
+        sleep 2
+    else
+        log_success "Anvil already running on port $ANVIL_PORT"
+    fi
+
+    # Deploy frUSD ERC-20 via Foundry script if coordinator-usd dir exists
+    if [ -d "$SUBFROST_ERC20_DIR/coordinator-usd" ]; then
+        log_info "Deploying frUSD ERC-20 token..."
+        (cd "$SUBFROST_ERC20_DIR/coordinator-usd" && bash start-coordinator.sh > /tmp/frusd-deploy.log 2>&1) &
+        sleep 5
+        # Verify deployment
+        CHAIN_ID=$("$CAST_BIN" chain-id --rpc-url http://127.0.0.1:$ANVIL_PORT 2>/dev/null)
+        log_success "EVM frUSD deployment attempted. Chain ID: $CHAIN_ID"
+        log_info "  Check /tmp/frusd-deploy.log for details"
+    else
+        log_warn "subfrost-erc20 dir not found at $SUBFROST_ERC20_DIR — skipping EVM frUSD deploy"
+    fi
+    echo ""
+
+    # =========================================================================
+    # Phase 8: frUSD Alkane Auth Token + Patched frUSD Token
+    # =========================================================================
+    # frUSD auth token deployed at [4, ~8200] range during e2e testing.
+    # Patched frusd-token adds opcodes 99 (name), 100 (symbol), 102 (decimals)
+    # required by OYL AMM pool factory for pool creation.
+    # Auth token slot: FRUSD_AUTH_TOKEN_TX (8200)
+    # frUSD token slot: FRUSD_TOKEN_TX (8210)
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 8: frUSD Alkane Auth Token + Patched frUSD Token"
+    log_info "=========================================="
+    echo ""
+
+    FRUSD_AUTH_TOKEN_TX="${FRUSD_AUTH_TOKEN_TX:-8200}"
+    FRUSD_TOKEN_TX="${FRUSD_TOKEN_TX:-8210}"
+    SUBFROST_ERC20_WASM_DIR="${SUBFROST_ERC20_WASM_DIR:-$SUBFROST_ERC20_DIR/alkanes/frusd-token}"
+
+    # Build patched frusd-token if source exists
+    if [ -f "$SUBFROST_ERC20_WASM_DIR/src/lib.rs" ]; then
+        log_info "Building patched frusd-token WASM (opcodes 99/100/102 for AMM compatibility)..."
+        (cd "$SUBFROST_ERC20_DIR" && \
+            CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+            AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar \
+            cargo build --release --target wasm32-unknown-unknown -p frusd-token 2>&1 | tail -3)
+        FRUSD_WASM="$SUBFROST_ERC20_DIR/target/wasm32-unknown-unknown/release/frusd_token.wasm"
+    else
+        FRUSD_WASM="${FRUSD_WASM:-$SUBFROST_ERC20_WASM_DIR/frusd_token_v2.wasm}"
+    fi
+
+    if [ -f "$FRUSD_WASM" ]; then
+        # Deploy frUSD auth token (opcode 100 = mint cap)
+        deploy_contract "frUSD Auth Token" "$WASM_DIR/alkanes_std_auth_token.wasm" \
+            "$FRUSD_AUTH_TOKEN_TX" "100"
+
+        # Deploy patched frUSD token with AMM-compatible opcodes
+        deploy_contract "frUSD Token (patched, opcodes 99/100/102)" "$FRUSD_WASM" \
+            "$FRUSD_TOKEN_TX" ""
+
+        log_success "frUSD alkane deployed at [4, $FRUSD_TOKEN_TX]"
+        log_info "  Verify: alkanes-cli simulate $FRUSD_TOKEN_TX:99 should return 0x6672555344 (frUSD)"
+    else
+        log_warn "frUSD WASM not found at $FRUSD_WASM — skipping frUSD alkane deploy"
+    fi
+    echo ""
+
+    # =========================================================================
+    # Phase 9: Carbine Orderbook Contracts
+    # =========================================================================
+    # Deployed and verified during regtest e2e testing (2026-04-14).
+    # Slots used:
+    #   carbine-template:    [4, 8202]
+    #   carbine-order-token: [4, 8203]
+    #   carbine-controller:  [4, 8260]  (patched: deposit consumes incoming_alkanes)
+    #
+    # token_id encoding: block * 1_000_000 + tx  (LEB128-safe)
+    #   frBTC [32,0]   → token_id = 32000000
+    #   frUSD [4,8210] → token_id = 4008210
+    #
+    # CRITICAL: carbine-controller must be built from current source
+    # (patched _deposit/_withdraw in subfrost-alkanes/alkanes/carbine-controller/src/lib.rs)
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 9: Carbine Orderbook Contracts"
+    log_info "=========================================="
+    echo ""
+
+    CARBINE_TEMPLATE_TX="${CARBINE_TEMPLATE_TX:-8202}"
+    CARBINE_ORDER_TOKEN_TX="${CARBINE_ORDER_TOKEN_TX:-8203}"
+    CARBINE_CONTROLLER_TX="${CARBINE_CONTROLLER_TX:-8260}"
+    SUBFROST_ALKANES_DIR="${SUBFROST_ALKANES_DIR:-$HOME/Documents/github/subfrost-alkanes}"
+
+    # Build carbine contracts from current source
+    if [ -d "$SUBFROST_ALKANES_DIR/alkanes/carbine-controller" ]; then
+        log_info "Building carbine contracts from source..."
+        (cd "$SUBFROST_ALKANES_DIR" && \
+            CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+            AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar \
+            cargo build --release --target wasm32-unknown-unknown \
+                -p carbine-template -p carbine-order-token -p carbine-controller 2>&1 | tail -3)
+        CARBINE_WASM_DIR="$SUBFROST_ALKANES_DIR/target/wasm32-unknown-unknown/release"
+    else
+        CARBINE_WASM_DIR="$WASM_DIR"
+    fi
+
+    CARBINE_TEMPLATE_WASM="$CARBINE_WASM_DIR/carbine_template.wasm"
+    CARBINE_ORDER_TOKEN_WASM="$CARBINE_WASM_DIR/carbine_order_token.wasm"
+    CARBINE_CONTROLLER_WASM="$CARBINE_WASM_DIR/carbine_controller.wasm"
+
+    if [ -f "$CARBINE_TEMPLATE_WASM" ] && [ -f "$CARBINE_ORDER_TOKEN_WASM" ] && [ -f "$CARBINE_CONTROLLER_WASM" ]; then
+        # Deploy carbine-template at [4, CARBINE_TEMPLATE_TX]
+        deploy_contract "Carbine Template" "$CARBINE_TEMPLATE_WASM" "$CARBINE_TEMPLATE_TX" ""
+
+        # Deploy carbine-order-token at [4, CARBINE_ORDER_TOKEN_TX]
+        deploy_contract "Carbine Order Token" "$CARBINE_ORDER_TOKEN_WASM" "$CARBINE_ORDER_TOKEN_TX" ""
+
+        # Deploy carbine-controller at [4, CARBINE_CONTROLLER_TX]
+        # No init args needed — initialized via opcode 0 call below
+        deploy_contract "Carbine Controller (patched deposit/withdraw)" \
+            "$CARBINE_CONTROLLER_WASM" "$CARBINE_CONTROLLER_TX" ""
+
+        # Initialize carbine-controller: opcode 0, template=[4,CARBINE_TEMPLATE_TX], order_token=[4,CARBINE_ORDER_TOKEN_TX]
+        log_info "Initializing Carbine Controller at [4,$CARBINE_CONTROLLER_TX]..."
+        CARBINE_INIT_PROTOSTONE="[4,$CARBINE_CONTROLLER_TX,0,4,$CARBINE_TEMPLATE_TX,4,$CARBINE_ORDER_TOKEN_TX]:v0:v0"
+        "$ALKANES_CLI" -p regtest \
+            --jsonrpc-url $RPC_URL \
+            --bitcoin-rpc-url $BITCOIN_RPC_URL \
+            --esplora-api-url $ESPLORA_URL \
+            --wallet-file "$WALLET_FILE" \
+            --passphrase "$DEPLOY_PASSWORD" \
+            alkanes execute "$CARBINE_INIT_PROTOSTONE" \
+            --from p2tr:0 \
+            --fee-rate 1 \
+            --mine \
+            -y
+
+        if [ $? -eq 0 ]; then
+            log_success "Carbine Controller initialized at [4,$CARBINE_CONTROLLER_TX]"
+            log_info "  Verify: alkanes-cli simulate $CARBINE_CONTROLLER_TX:25 → 0x0..0 (0 open orders)"
+        else
+            log_warn "Carbine Controller initialization may have failed"
+        fi
+    else
+        log_warn "Carbine WASMs not found — skipping carbine deployment"
+        log_info "  Expected: $CARBINE_TEMPLATE_WASM"
+        log_info "  Expected: $CARBINE_ORDER_TOKEN_WASM"
+        log_info "  Expected: $CARBINE_CONTROLLER_WASM"
+    fi
+    echo ""
+
+    # =========================================================================
+    # Phase 10: DxBTC Vault (rebuilt from current source)
+    # =========================================================================
+    # CRITICAL: The deployed WASM at [4, 0x1f00] may be stale (old version
+    # subcalls yvFrBtcVault during swap_internal). Current source handles
+    # frBTC→dxBTC directly without delegation.
+    #
+    # If the existing dx-btc at [4, 0x1f00] is stale, deploy fresh to a new slot.
+    # Verified working slot: [4, 8270] (deployed 2026-04-14).
+    #
+    # Init args: opcode(0), asset=[32,0], yv_fr_btc=[4,0x1f01],
+    #            escrow=[4,0x1f22], vx_fuel=[4,0x1f14]
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 10: DxBTC Vault (current source)"
+    log_info "=========================================="
+    echo ""
+
+    DXBTC_TX="${DXBTC_TX:-8270}"
+
+    if [ -d "$SUBFROST_ALKANES_DIR/alkanes/dx-btc" ]; then
+        log_info "Building dx-btc from current source..."
+        (cd "$SUBFROST_ALKANES_DIR" && \
+            CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+            AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar \
+            cargo build --release --target wasm32-unknown-unknown -p dx-btc 2>&1 | tail -3)
+        DXBTC_WASM="$SUBFROST_ALKANES_DIR/target/wasm32-unknown-unknown/release/dx_btc.wasm"
+    else
+        DXBTC_WASM="$WASM_DIR/dx_btc.wasm"
+    fi
+
+    if [ -f "$DXBTC_WASM" ]; then
+        # Deploy dx-btc with init args:
+        #   opcode=0, asset=frBTC[32,0], yv_fr_btc=[4,0x1f01],
+        #   escrow_nft=[4,0x1f22], vx_fuel_gauge=[4,0x1f14]
+        deploy_contract "DxBTC Vault (current source)" "$DXBTC_WASM" "$DXBTC_TX" \
+            "0,32,0,4,$((0x1f01)),4,$((0x1f22)),4,$((0x1f14))"
+
+        log_success "DxBTC Vault deployed at [4,$DXBTC_TX]"
+        log_info "  Verify: alkanes-cli simulate $DXBTC_TX:11 → total_assets (u128 LE)"
+        log_info "  Deposit: alkanes execute '[4,$DXBTC_TX,1]:v0:v0' --inputs frBTC_utxo"
+    else
+        log_warn "dx-btc WASM not found at $DXBTC_WASM — skipping DxBTC deploy"
+    fi
+    echo ""
+
+    # =========================================================================
+    # Phase 11: frUSD/frBTC Pool Creation
+    # =========================================================================
+    # Creates the OYL AMM pool for frUSD[4,FRUSD_TOKEN_TX] / frBTC[32,0].
+    # Requires frUSD token to have opcodes 99/100/102 (Phase 8 patched build).
+    # Pool factory: [4, AMM_FACTORY_PROXY_TX]
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 11: frUSD/frBTC Pool Creation"
+    log_info "=========================================="
+    echo ""
+
+    FRUSD_POOL_FRUSD_AMOUNT="${FRUSD_POOL_FRUSD_AMOUNT:-100000000}"  # 100M frUSD (6 decimals = 100 frUSD)
+    FRUSD_POOL_FRBTC_AMOUNT="${FRUSD_POOL_FRBTC_AMOUNT:-50000000}"   # 50M frBTC sats
+
+    log_info "Creating frUSD[4,$FRUSD_TOKEN_TX]/frBTC[32,0] pool..."
+    log_info "  Amounts: $FRUSD_POOL_FRUSD_AMOUNT frUSD : $FRUSD_POOL_FRBTC_AMOUNT frBTC"
+    "$ALKANES_CLI" -p regtest \
+        --jsonrpc-url $RPC_URL \
+        --bitcoin-rpc-url $BITCOIN_RPC_URL \
+        --esplora-api-url $ESPLORA_URL \
+        --wallet-file "$WALLET_FILE" \
+        --passphrase "$DEPLOY_PASSWORD" \
+        alkanes init-pool \
+        --pair "4:$FRUSD_TOKEN_TX,32:0" \
+        --liquidity "$FRUSD_POOL_FRUSD_AMOUNT:$FRUSD_POOL_FRBTC_AMOUNT" \
+        --to p2tr:0 \
+        --from p2tr:0 \
+        --mine \
+        --change p2tr:0 \
+        --factory "4:$AMM_FACTORY_PROXY_TX" \
+        --auto-confirm \
+        --trace
+
+    if [ $? -eq 0 ]; then
+        log_success "frUSD/frBTC pool created!"
+        sleep 5
+    else
+        log_warn "frUSD/frBTC pool creation failed (may need frUSD balance first)"
+        log_info "  Ensure frUSD is minted and available at p2tr:0 before running this phase"
+    fi
+    echo ""
+
+    # =========================================================================
+    # Phase 12: espo, secondaryview shim, subzero-node startup
+    # =========================================================================
+    # Services required for full e2e stack (verified 2026-04-14):
+    #   espo:              UTxO indexer on port 8888
+    #   secondaryview-shim: bridges subzero-node ↔ esplora on port 50010
+    #   subzero-node:      FROST signing coordinator on port 9800
+    #
+    # Keys: ~/Documents/github/subzero-rs/regtest-keys/
+    # Signals: ~/Documents/github/subzero-rs/regtest-signals.toml
+    # Threshold: 2-of-3 signers
+    # =========================================================================
+    log_info "=========================================="
+    log_info "Phase 12: Support Services (espo, shim, subzero-node)"
+    log_info "=========================================="
+    echo ""
+
+    SUBZERO_DIR="${SUBZERO_DIR:-$HOME/Documents/github/subzero-rs}"
+
+    # Start espo if not running
+    if ! curl -s --data-binary '{"jsonrpc":"2.0","method":"get_espo_height","params":[],"id":1}' \
+        http://127.0.0.1:8888/rpc > /dev/null 2>&1; then
+        log_info "espo not detected on port 8888 — start it separately if needed"
+        log_info "  (espo is typically started via docker-compose in the subfrost monorepo)"
+    else
+        log_success "espo running at port 8888 (height confirmed)"
+    fi
+
+    # Start secondaryview shim if not running
+    if ! pgrep -f "secondaryview-shim.js" > /dev/null 2>&1; then
+        if [ -f "$SUBZERO_DIR/secondaryview-shim.js" ]; then
+            log_info "Starting secondaryview-shim..."
+            node "$SUBZERO_DIR/secondaryview-shim.js" > /tmp/secondaryview-shim.log 2>&1 &
+            SHIM_PID=$!
+            sleep 1
+            log_success "secondaryview-shim started (PID $SHIM_PID)"
+        else
+            log_warn "secondaryview-shim.js not found at $SUBZERO_DIR/secondaryview-shim.js"
+        fi
+    else
+        log_success "secondaryview-shim already running"
+    fi
+
+    # Start subzero-node if not running
+    if ! pgrep -f "subzero-node" > /dev/null 2>&1; then
+        if [ -f "$SUBZERO_DIR/target/release/subzero-node" ] && \
+           [ -d "$SUBZERO_DIR/regtest-keys" ] && \
+           [ -f "$SUBZERO_DIR/regtest-signals.toml" ]; then
+            log_info "Starting subzero-node (threshold 2-of-3)..."
+            (cd "$SUBZERO_DIR" && \
+                ./target/release/subzero-node run \
+                    --keystore ./regtest-keys \
+                    --threshold 2 \
+                    --signers 3 \
+                    --signals regtest-signals.toml \
+                    --programs-dir ./compiled_programs \
+                    --api-addr 127.0.0.1:9800 \
+                    --eval-interval-ms 5000 \
+                > /tmp/subzero-node.log 2>&1 &)
+            SUBZERO_PID=$!
+            sleep 2
+            log_success "subzero-node started (PID $SUBZERO_PID)"
+            log_info "  Logs: /tmp/subzero-node.log"
+            log_info "  API: http://127.0.0.1:9800"
+        else
+            log_warn "subzero-node not ready — build it first:"
+            log_info "  cd $SUBZERO_DIR && cargo build --release"
+            log_info "  Keys expected at: $SUBZERO_DIR/regtest-keys/"
+            log_info "  Signals expected at: $SUBZERO_DIR/regtest-signals.toml"
+        fi
+    else
+        log_success "subzero-node already running"
+    fi
+    echo ""
+
     echo ""
     log_info "=========================================="
     log_info "Deployment Summary"
@@ -680,26 +1018,25 @@ main() {
     echo "  - frBTC:                  [32, 0]"
     echo ""
     echo "Core Contracts:"
-    echo "  - dxBTC Vault:            [2, 1]   (CREATE, deps: frBTC[32,0], yv-fr-btc[3,0])"
-    echo "  - yv-fr-btc Vault:        [3, 0]   (RESERVED, deps: frBTC[32,0])"
-    echo "  - ftrBTC Master:          [31, 0]  (RESERVED)"
+    echo "  - dxBTC Vault:            [4, $((0x1f00))]  (reserved slot, may be stale — see Phase 10)"
+    echo "  - yv-fr-btc Vault:        [4, $((0x1f01))]  (reserved slot)"
+    echo "  - ftrBTC Master:          [31, 0]  (auto-deployed by genesis)"
     echo ""
     echo "LBTC System:"
-    echo "  - FROST Token:            [4, 10]"
-    echo "  - pLBTC:                  [4, 11]"
-    echo "  - yxLBTC:                 [4, 12]"
-    echo "  - LBTC Yield Splitter:    [4, 13]  (deps: pLBTC[4,11], yxLBTC[4,12])"
-    echo "  - Synth Pool:             [4, 30]  (deps: pLBTC[4,11], frBTC[32,0])"
+    echo "  - LBTC Yield Splitter:    [4, $((0x1f10))]"
+    echo "  - pLBTC:                  [4, $((0x1f11))]"
+    echo "  - yxLBTC:                 [4, $((0x1f12))]"
+    echo "  - FROST Token:            [4, $((0x1f13))]"
+    echo "  - vxFROST Gauge:          [4, $((0x1f14))]"
+    echo "  - Synth Pool:             [4, $((0x1f15))]"
+    echo "  - LBTC Oracle:            [4, $((0x1f16))]"
+    echo "  - LBTC Token:             [4, $((0x1f17))]"
     echo ""
-    echo "Governance:"
-    echo "  - vxFROST Gauge:          [4, 50]"
-    echo "  - veDIESEL Vault:         [4, 60]"
-    echo ""
-    echo "Additional Vaults & Gauges:"
-    echo "  - Gauge Contract:         [4, 100]"
-    echo "  - yvBOOST Vault:          [4, 101]"
-    echo "  - yvTOKEN Vault:          [4, 102]"
-    echo "  - yveDIESEL Vault:        [4, 103]"
+    echo "Templates:"
+    echo "  - Unit Template:          [4, $((0x1f20))]"
+    echo "  - VE Token Vault Template:[4, $((0x1f21))]"
+    echo "  - YVE Token NFT Template: [4, $((0x1f22))]"
+    echo "  - VX Token Gauge Template:[4, $((0x1f23))]"
     echo ""
     echo "OYL AMM System:"
     echo "  - OYL Auth Token Factory: [4, $AUTH_TOKEN_FACTORY_ID]"
@@ -711,6 +1048,33 @@ main() {
     echo ""
     echo "Test Pool:"
     echo "  - DIESEL/frBTC Pool:      Created with 300M DIESEL / 50K frBTC"
+    echo ""
+    echo "EVM (Anvil regtest, chain ID 31337):"
+    echo "  - frUSD ERC-20:           0x9A676e781A523b5d0C0e43731313A708CB607508"
+    echo "  - Anvil port:             $ANVIL_PORT"
+    echo ""
+    echo "frUSD Alkane System:"
+    echo "  - frUSD Auth Token:       [4, $FRUSD_AUTH_TOKEN_TX]"
+    echo "  - frUSD Token (patched):  [4, $FRUSD_TOKEN_TX]  (opcodes 99/100/102 for AMM)"
+    echo "  - frUSD/frBTC Pool:       Created via OYL AMM factory"
+    echo ""
+    echo "Carbine Orderbook:"
+    echo "  - Carbine Template:       [4, $CARBINE_TEMPLATE_TX]"
+    echo "  - Carbine Order Token:    [4, $CARBINE_ORDER_TOKEN_TX]"
+    echo "  - Carbine Controller:     [4, $CARBINE_CONTROLLER_TX]  (patched deposit/withdraw)"
+    echo "    token_id encoding:      block * 1_000_000 + tx  (frBTC=32000000, frUSD=4008210)"
+    echo "    opcodes: 1=deposit 2=withdraw 20=place-limit-order 21=cancel-order 25=order-count"
+    echo ""
+    echo "DxBTC Vault (current source):"
+    echo "  - DxBTC Vault:            [4, $DXBTC_TX]"
+    echo "    init: asset=frBTC[32,0] yv_fr_btc=[4,$((0x1f01))] escrow=[4,$((0x1f22))] vx_fuel=[4,$((0x1f14))]"
+    echo "    opcode 11 = total_assets, opcode 1 = deposit frBTC → dxBTC shares"
+    echo ""
+    echo "Support Services:"
+    echo "  - Anvil (EVM):            http://127.0.0.1:$ANVIL_PORT"
+    echo "  - espo (UTxO indexer):    http://127.0.0.1:8888/rpc"
+    echo "  - secondaryview-shim:     bridges subzero ↔ esplora"
+    echo "  - subzero-node:           http://127.0.0.1:9800 (2-of-3 FROST signing)"
     echo ""
     
 
