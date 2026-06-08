@@ -1459,12 +1459,24 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         // Use final_funding_outpoints which may have inscribed UTXOs replaced with clean ones from split
         // When alkane inputs are specified, route them to the first protomessage (not output 0)
         let has_alkane_inputs = params.input_requirements.iter().any(|r| matches!(r, InputRequirement::Alkanes { .. }));
-        let runestone_script = self.construct_runestone_script_with_alkane_routing(&final_protostones, outputs.len(), has_alkane_inputs)?;
-        let prefetched_for_build = build_prefetched_txouts_map(params)?;
         // Rebar payment output is only added on mainnet (the submit gate in
         // resume_execution is also mainnet-only). Off-mainnet we keep the normal
         // fee/broadcast so use_rebar can be set harmlessly in dev/regtest.
+        //
+        // Hoisted ABOVE the runestone build so the protostone shadow-vout encode can
+        // account for the SECOND trailing output (the Rebar payment) appended in
+        // build_psbt_and_fee on mainnet. With Rebar the final tx is
+        // [..base.., OP_RETURN, REBAR] so trailing_outputs=1; otherwise just OP_RETURN
+        // follows the base outputs (trailing_outputs=0). See indexer
+        // protorune/src/lib.rs:1028 `shadow_vout = i + tx.output.len() + 1`.
         let rebar_on_mainnet = params.use_rebar && network == bitcoin::Network::Bitcoin;
+        let runestone_script = self.construct_runestone_script_with_alkane_routing(
+            &final_protostones,
+            outputs.len(),
+            has_alkane_inputs,
+            if rebar_on_mainnet { 1 } else { 0 },
+        )?;
+        let prefetched_for_build = build_prefetched_txouts_map(params)?;
         let (psbt, fee, estimated_vsize) = self.build_psbt_and_fee(final_funding_outpoints.clone(), outputs, Some(runestone_script), params.fee_rate, None, None, prefetched_for_build.as_ref(), rebar_on_mainnet, params.rebar_tier).await?;
 
         // Validate the transaction before returning
@@ -2722,10 +2734,10 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
     fn convert_protostone_specs(&self, specs: &[ProtostoneSpec]) -> Result<Vec<protorune_support::protostone::Protostone>> {
         // We need to know how many physical outputs there are to calculate protostone shadow outputs
         // For now, we'll need to pass this information. Let's use a helper closure.
-        self.convert_protostone_specs_with_output_count(specs, 0) // Will be updated with actual count
+        self.convert_protostone_specs_with_output_count(specs, 0, 0) // Will be updated with actual count
     }
 
-    fn convert_protostone_specs_with_output_count(&self, specs: &[ProtostoneSpec], num_physical_outputs: u32) -> Result<Vec<protorune_support::protostone::Protostone>> {
+    fn convert_protostone_specs_with_output_count(&self, specs: &[ProtostoneSpec], num_physical_outputs: u32, trailing_outputs: u32) -> Result<Vec<protorune_support::protostone::Protostone>> {
         specs.iter().enumerate().map(|(i, spec)| {
             let edicts = spec.edicts.iter().map(|e| {
                 Ok(ProtoruneEdict {
@@ -2740,7 +2752,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
                         // After OP_RETURN is appended, tx.output.len() = num_physical_outputs + 1.
                         // Protorune indexer maps protostone N to vout = tx.output.len() + 1 + N
                         //   = (num_physical_outputs + 1) + 1 + N = num_physical_outputs + 2 + N.
-                        OutputTarget::Protostone(p) => (num_physical_outputs + 2 + p) as u128,
+                        OutputTarget::Protostone(p) => (num_physical_outputs + 2 + trailing_outputs + p) as u128,
                         OutputTarget::Split => 0, // Split not supported in ProtostoneEdict
                     },
                 })
@@ -2756,7 +2768,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
                     Some(*v)
                 }
                 Some(OutputTarget::Protostone(p)) => {
-                    let calculated = num_physical_outputs + 2 + p;
+                    let calculated = num_physical_outputs + 2 + trailing_outputs + p;
                     log::info!("  Pointer: p{} (shadow output = {} + 2 + {} = {})", p, num_physical_outputs, p, calculated);
                     Some(calculated)
                 }
@@ -2777,7 +2789,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
                     Some(*v)
                 }
                 Some(OutputTarget::Protostone(p)) => {
-                    let calculated = num_physical_outputs + 2 + p;
+                    let calculated = num_physical_outputs + 2 + trailing_outputs + p;
                     log::info!("  Refund: p{} (shadow output = {} + 2 + {} = {})", p, num_physical_outputs, p, calculated);
                     Some(calculated)
                 }
@@ -2804,15 +2816,17 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
     }
 
     fn construct_runestone_script(&self, protostones: &[ProtostoneSpec], num_outputs: usize) -> Result<ScriptBuf> {
-        self.construct_runestone_script_with_alkane_routing(protostones, num_outputs, false)
+        // reveal-psbt (3536) and deploy-reveal (4104) callers append ONLY the OP_RETURN
+        // trailing output (use_rebar=false on those paths), so trailing_outputs=0.
+        self.construct_runestone_script_with_alkane_routing(protostones, num_outputs, false, 0)
     }
 
-    fn construct_runestone_script_with_alkane_routing(&self, protostones: &[ProtostoneSpec], num_outputs: usize, has_alkane_inputs: bool) -> Result<ScriptBuf> {
+    fn construct_runestone_script_with_alkane_routing(&self, protostones: &[ProtostoneSpec], num_outputs: usize, has_alkane_inputs: bool, trailing_outputs: u32) -> Result<ScriptBuf> {
         log::info!("Constructing runestone with {} protostones and {} outputs (before OP_RETURN), alkane_inputs={}", protostones.len(), num_outputs, has_alkane_inputs);
         log::info!("  After OP_RETURN is added, tx.output.len() = {} + 1 = {}", num_outputs, num_outputs + 1);
         log::info!("  Formula: pN -> vout = {} + 1 + N = {} + N", num_outputs, num_outputs + 1);
 
-        let converted_protostones = self.convert_protostone_specs_with_output_count(protostones, num_outputs as u32)?;
+        let converted_protostones = self.convert_protostone_specs_with_output_count(protostones, num_outputs as u32, trailing_outputs)?;
 
         // Debug logging
         for (i, p) in converted_protostones.iter().enumerate() {
@@ -4242,6 +4256,65 @@ mod tests {
         for output in outputs {
             assert_eq!(output.value, Amount::from_sat(10000));
         }
+    }
+
+    /// Regression: the protostone shadow-vout target encoded by the SDK must equal the
+    /// indexer's runtime `shadow_vout = i + tx.output.len() + 1` (protorune/src/lib.rs:1028)
+    /// for BOTH the no-rebar and rebar-on-mainnet output layouts.
+    ///
+    /// A bond is 2 protostones (p0 shifter, p1 cellpack) over 3 BASE outputs (v0,v1,change).
+    ///   NO-rebar:   final outputs = [v0,v1,change,OP_RETURN]        len=4 -> indexer p1 = 1+4+1 = 6
+    ///   WITH-rebar: final outputs = [v0,v1,change,OP_RETURN,REBAR]  len=5 -> indexer p1 = 1+5+1 = 7
+    /// SDK formula = num_physical_outputs(3) + 2 + trailing_outputs + p.
+    ///   trailing=0 -> 3+2+0+1 = 6 (matches indexer, no-rebar invariant preserved)
+    ///   trailing=1 -> 3+2+1+1 = 7 (matches indexer, fixes the Rebar off-by-one bug)
+    ///
+    /// Before this fix, both cases encoded 6 -> the rebar bond cellpack's routed alkanes
+    /// landed on the wrong shadow vout -> revert -> LP revert-burned. Every mainnet Rebar
+    /// bond was affected.
+    #[test]
+    fn test_protostone_shadow_vout_matches_indexer_with_and_without_rebar() {
+        // mainnet network so the layout matches the rebar-on-mainnet path under test.
+        let mut provider = MockProvider::new(Network::Bitcoin);
+        let executor = EnhancedAlkanesExecutor::new(&mut provider);
+
+        // Minimal 2-protostone bond: p0 shifter (pointer/refund -> p1), p1 cellpack.
+        // The value under test is p0's pointer/refund == p1's shadow vout.
+        let specs = vec![
+            ProtostoneSpec {
+                cellpack: None,
+                edicts: vec![],
+                bitcoin_transfer: None,
+                pointer: Some(OutputTarget::Protostone(1)),
+                refund: Some(OutputTarget::Protostone(1)),
+            },
+            ProtostoneSpec {
+                cellpack: Some(alkanes_support::cellpack::Cellpack {
+                    target: alkanes_support::id::AlkaneId { block: 2, tx: 0 },
+                    inputs: vec![1],
+                }),
+                edicts: vec![],
+                bitcoin_transfer: None,
+                pointer: Some(OutputTarget::Output(1)),
+                refund: Some(OutputTarget::Output(0)),
+            },
+        ];
+
+        let num_base_outputs: u32 = 3; // v0, v1, change
+
+        // --- NO-rebar (trailing_outputs = 0): indexer 1 + final_len(4) + 1 = 6 ---
+        let no_rebar = executor
+            .convert_protostone_specs_with_output_count(&specs, num_base_outputs, 0)
+            .unwrap();
+        assert_eq!(no_rebar[0].pointer, Some(6), "no-rebar p1 shadow vout must be 6");
+        assert_eq!(no_rebar[0].refund, Some(6), "no-rebar p1 refund shadow vout must be 6");
+
+        // --- WITH-rebar (trailing_outputs = 1): indexer 1 + final_len(5) + 1 = 7 ---
+        let with_rebar = executor
+            .convert_protostone_specs_with_output_count(&specs, num_base_outputs, 1)
+            .unwrap();
+        assert_eq!(with_rebar[0].pointer, Some(7), "rebar p1 shadow vout must be 7");
+        assert_eq!(with_rebar[0].refund, Some(7), "rebar p1 refund shadow vout must be 7");
     }
 
     /// `is_wrap_protostone` must reliably distinguish frBTC/frZEC/frETH wraps
