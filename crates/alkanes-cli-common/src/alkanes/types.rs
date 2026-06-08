@@ -396,6 +396,18 @@ pub struct EnhancedExecuteParams {
     /// without a synced indexer notion (devnet/regtest).
     #[serde(default)]
     pub max_indexed_height: Option<u64>,
+    /// When true (and on mainnet), submit the signed transaction through Rebar
+    /// Shield's private mempool instead of the normal broadcast path, and add a
+    /// Rebar PAYMENT OUTPUT (vsize × tier.feerate sats, P2WPKH to the address
+    /// from Rebar's `/v1/info`) in lieu of a miner fee. Mirrors the brc20_prog
+    /// rebar pattern (see `brc20_prog/execute.rs::calculate_rebar_payment` and
+    /// the `WalletProvider::send` gate at `provider.rs` — mainnet-only).
+    #[serde(default)]
+    pub use_rebar: bool,
+    /// 1-based Rebar fee tier index (see `provider::rebar::get_tier`). Defaults
+    /// to tier 1 when `use_rebar` is set and this is `None`.
+    #[serde(default)]
+    pub rebar_tier: Option<u8>,
 }
 
 /// Caller-supplied per-outpoint TxOut data for `EnhancedExecuteParams::prefetched_utxos`.

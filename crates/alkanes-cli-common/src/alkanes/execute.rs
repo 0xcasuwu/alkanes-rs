@@ -43,6 +43,15 @@ use protorune_support::balance_sheet::ProtoruneRuneId;
 const MAX_FEE_SATS: u64 = 100_000; // 0.001 BTC. Cap to avoid "absurdly high fee rate" errors.
 const DUST_LIMIT: u64 = 546;
 
+/// Resolved Rebar Shield payment for the simple execute path. Ported from
+/// brc20_prog/execute.rs:23-25 — the P2WPKH payment address (from Rebar's
+/// /v1/info) and the payment amount (tx_vsize × tier.feerate). When present,
+/// build_psbt_and_fee appends this as a PRE-sign output and zeroes the miner fee.
+struct RebarPaymentInfo {
+    payment_address: Address,
+    payment_amount: u64,
+}
+
 /// frBTC, frZEC, frETH and any other cross-chain wrap target lives at block 32
 /// in the alkanes namespace. The wrap opcode is uniformly 77 across these
 /// contracts (calls `exchange()` which mints the wrapped representation).
@@ -531,6 +540,31 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
 
         self.validate_envelope_cellpack_usage(&params)?;
 
+        // Rebar Shield is only wired into the SIMPLE single-transaction path
+        // (build_single_transaction → build_psbt_and_fee), which is the one that
+        // adds the PRE-sign Rebar payment output and zeroes the miner fee. The
+        // split (CPFP wrap→execute) and envelope (commit/reveal) paths build their
+        // own multi-tx fee/output structures and do NOT add a Rebar payment, so a
+        // tx submitted there would be unpaid and dropped by Rebar's relay. Fail
+        // loud rather than silently submitting an unpaid tx.
+        if params.use_rebar {
+            let routes_to_split = params.split_transactions
+                && !params.protostones.is_empty()
+                && is_wrap_protostone(&params.protostones[0])
+                && params.protostones.len() >= 2
+                && params.envelope_data.is_none();
+            if routes_to_split {
+                return Err(AlkanesError::Other(
+                    "Rebar Shield (use_rebar) is not supported on the split_transactions (CPFP wrap→execute) path; the child tx would be submitted unpaid and dropped by Rebar".to_string(),
+                ));
+            }
+            if params.envelope_data.is_some() {
+                return Err(AlkanesError::Other(
+                    "Rebar Shield (use_rebar) is not supported on the envelope/commit-reveal deployment path; the reveal tx would be submitted unpaid and dropped by Rebar".to_string(),
+                ));
+            }
+        }
+
         // Split-tx mode: when the request begins with a wrap protostone and
         // the caller opted in via params.split_transactions=true, fork the
         // protostones across two CPFP-chained transactions so each tx gets
@@ -769,6 +803,21 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
             } else {
                 return Err(AlkanesError::RpcError("No txids returned from broadcast".to_string()));
             }
+        } else if params.use_rebar
+            && self.provider.get_network() == bitcoin::Network::Bitcoin
+        {
+            // Rebar Shield private-relay submit. Mirrors the WalletProvider::send
+            // gate at provider.rs:1406 and brc20_prog/execute.rs::broadcast_with_options:
+            // mainnet-only, submit the signed tx via Rebar's /v1/rpc instead of the
+            // normal broadcast. The Rebar PAYMENT OUTPUT was already added PRE-sign in
+            // build_psbt_and_fee (no post-sign patching). On non-mainnet we fall through
+            // to the normal broadcast below (build_single_transaction also skips the
+            // payment output off-mainnet, keeping the two consistent).
+            log::info!("🔒 Using Rebar Shield for private transaction broadcast (tier {})",
+                params.rebar_tier.unwrap_or(1));
+            crate::provider::rebar::submit_transaction(&tx_hex)
+                .await
+                .map_err(|e| AlkanesError::Network(format!("Rebar Shield error: {}", e)))?
         } else {
             // No split, just broadcast the main transaction
             self.provider.broadcast_transaction(tx_hex).await?
@@ -1412,7 +1461,11 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         let has_alkane_inputs = params.input_requirements.iter().any(|r| matches!(r, InputRequirement::Alkanes { .. }));
         let runestone_script = self.construct_runestone_script_with_alkane_routing(&final_protostones, outputs.len(), has_alkane_inputs)?;
         let prefetched_for_build = build_prefetched_txouts_map(params)?;
-        let (psbt, fee, estimated_vsize) = self.build_psbt_and_fee(final_funding_outpoints.clone(), outputs, Some(runestone_script), params.fee_rate, None, None, prefetched_for_build.as_ref()).await?;
+        // Rebar payment output is only added on mainnet (the submit gate in
+        // resume_execution is also mainnet-only). Off-mainnet we keep the normal
+        // fee/broadcast so use_rebar can be set harmlessly in dev/regtest.
+        let rebar_on_mainnet = params.use_rebar && network == bitcoin::Network::Bitcoin;
+        let (psbt, fee, estimated_vsize) = self.build_psbt_and_fee(final_funding_outpoints.clone(), outputs, Some(runestone_script), params.fee_rate, None, None, prefetched_for_build.as_ref(), rebar_on_mainnet, params.rebar_tier).await?;
 
         // Validate the transaction before returning
         self.validate_transaction(&psbt, &final_funding_outpoints, fee, params).await?;
@@ -2787,6 +2840,60 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         Ok(runestone.encipher())
     }
 
+    /// Resolved Rebar payment for the simple (non-split, non-commit/reveal)
+    /// execute path. Ported verbatim from brc20_prog/execute.rs
+    /// (`RebarPaymentInfo` at line 23-25, `calculate_rebar_payment` at line
+    /// 2210): query Rebar's /v1/info, pick the 1-based tier (default 1),
+    /// payment = tx_vsize × tier.feerate, P2WPKH address resolved with
+    /// require_network(self.provider.get_network()). Returns None when
+    /// use_rebar is false. Note: like brc20_prog, this computes the payment
+    /// regardless of network — the mainnet-only gate lives at the submit
+    /// site (resume_execution) — but build_single_transaction only invokes it
+    /// when on mainnet so off-mainnet runs never carry an unused payment
+    /// output.
+    async fn calculate_rebar_payment(
+        &mut self,
+        tx_vsize: usize,
+        use_rebar: bool,
+        rebar_tier: Option<u8>,
+    ) -> Result<Option<RebarPaymentInfo>> {
+        if !use_rebar {
+            return Ok(None);
+        }
+
+        log::info!("🔒 Querying Rebar Shield for payment info...");
+        use crate::provider::rebar;
+
+        let rebar_info = rebar::query_info()
+            .await
+            .map_err(|e| AlkanesError::Network(format!("Failed to query Rebar info: {}", e)))?;
+
+        let tier_index = rebar_tier.unwrap_or(1);
+        let tier = rebar::get_tier(&rebar_info, tier_index)
+            .map_err(|e| AlkanesError::Network(format!("Failed to get Rebar tier: {}", e)))?;
+
+        let payment_amount = rebar::calculate_payment(tx_vsize, tier);
+
+        log::info!(
+            "   Rebar tier {}: {} sat/vB @ {:.0}% hashrate",
+            tier_index,
+            tier.feerate,
+            tier.estimated_hashrate * 100.0
+        );
+        log::info!("   Payment amount: {} sats", payment_amount);
+        log::info!("   Payment address: {}", rebar_info.payment.p2wpkh);
+
+        let payment_address = Address::from_str(&rebar_info.payment.p2wpkh)
+            .map_err(|e| AlkanesError::Network(format!("Invalid Rebar payment address: {}", e)))?
+            .require_network(self.provider.get_network())
+            .map_err(|e| AlkanesError::Network(format!("Rebar payment address network mismatch: {}", e)))?;
+
+        Ok(Some(RebarPaymentInfo {
+            payment_address,
+            payment_amount,
+        }))
+    }
+
     async fn build_psbt_and_fee(
         &mut self,
         utxos: Vec<OutPoint>,
@@ -2800,6 +2907,13 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         // here so the per-input loop below can skip the slow getrawtransaction
         // path for every outpoint the JS wallet has already cached.
         prefetched_txouts: Option<&alloc::collections::BTreeMap<OutPoint, TxOut>>,
+        // Rebar private-relay opt-in for the SIMPLE (non-split, non-commit/reveal)
+        // path. When use_rebar is set, a Rebar PAYMENT OUTPUT (vsize × tier.feerate
+        // P2WPKH) is appended PRE-sign and the miner fee is forced to 0 — mirroring
+        // brc20_prog/execute.rs activation-tx assembly (lines 920-1005). The reveal/
+        // envelope caller passes false (that path doesn't support Rebar here).
+        use_rebar: bool,
+        rebar_tier: Option<u8>,
     ) -> Result<(Psbt, u64, usize)> {
         use bitcoin::transaction::Version;
 
@@ -2866,6 +2980,34 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
             }
         }
     
+        // ── Rebar Shield payment output (PRE-sign, mirrors brc20_prog) ──────────
+        // When use_rebar is set, compute the Rebar payment (vsize × tier.feerate)
+        // and append a P2WPKH payment TxOut. The payment REPLACES the miner fee
+        // (fee → 0). We estimate vsize including the payment output (its ~31-byte
+        // P2WPKH scriptPubKey adds to the tx) by pushing a placeholder onto the
+        // temp tx before measuring. This matches brc20_prog/execute.rs:929-1002:
+        // estimate vsize → calc rebar_payment → build [op_return, rebar?, change]
+        // → fee = 0 if rebar.
+        let rebar_payment = if use_rebar {
+            // Push a placeholder payment output onto the temp tx so the vsize the
+            // payment is computed from reflects the real (payment-included) tx.
+            let probe_vsize = {
+                let mut probe_tx = temp_tx.clone();
+                // 22-byte P2WPKH scriptPubKey placeholder (OP_0 <20-byte hash>).
+                let mut wpkh_script = vec![0x00u8, 0x14u8];
+                wpkh_script.extend_from_slice(&[0u8; 20]);
+                probe_tx.output.push(TxOut {
+                    value: bitcoin::Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(wpkh_script),
+                });
+                probe_tx.vsize()
+            };
+            self.calculate_rebar_payment(probe_vsize, use_rebar, rebar_tier).await?
+        } else {
+            None
+        };
+        let rebar_payment_amount = rebar_payment.as_ref().map(|r| r.payment_amount).unwrap_or(0);
+
         // Use network-appropriate default fee rate (already calculated in build_single_transaction)
         // Keep 600.0 as absolute fallback for commit transactions which may not have network context
         let fee_rate_sat_vb = fee_rate.unwrap_or(10.0); // Lowered from 600.0
@@ -2873,16 +3015,39 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         let estimated_fee = (fee_rate_sat_vb * estimated_vsize as f32).ceil() as u64;
         // Add a small buffer (1%) to account for any size differences between temp tx and final signed tx
         let estimated_fee_with_buffer = (estimated_fee as f64 * 1.01).ceil() as u64;
-        let capped_fee = estimated_fee_with_buffer.min(MAX_FEE_SATS);
+        // For Rebar, the miner fee is 0 — the Rebar payment output replaces it.
+        let capped_fee = if rebar_payment.is_some() {
+            0
+        } else {
+            estimated_fee_with_buffer.min(MAX_FEE_SATS)
+        };
         log::info!("Estimated fee: {estimated_fee}, With buffer: {estimated_fee_with_buffer}, Capped fee: {capped_fee}");
-    
+
+        // Append the Rebar payment output (if any) BEFORE the change calc so it's
+        // counted as a non-change output and subtracted from change.
+        if let Some(ref rebar) = rebar_payment {
+            outputs.push(TxOut {
+                value: bitcoin::Amount::from_sat(rebar.payment_amount),
+                script_pubkey: rebar.payment_address.script_pubkey(),
+            });
+        }
+
         let total_output_value_sans_change: u64 = outputs.iter()
             .filter(|o| o.value.to_sat() > 0)
             .map(|o| o.value.to_sat())
             .sum();
-    
+
         let change_value = total_input_value.saturating_sub(total_output_value_sans_change).saturating_sub(capped_fee);
-    
+
+        // Guard: a Rebar tx with no viable change output would either burn the
+        // remainder or underpay. Mirror brc20_prog's >= 546 dust guard.
+        if rebar_payment.is_some() && change_value < DUST_LIMIT {
+            return Err(AlkanesError::Wallet(format!(
+                "Not enough funds for Rebar transaction: change {} < dust {} (payment {} sats)",
+                change_value, DUST_LIMIT, rebar_payment_amount
+            )));
+        }
+
         if let Some(change_output) = outputs.iter_mut().find(|o| o.value.to_sat() == 0 && !o.script_pubkey.is_op_return()) {
             change_output.value = bitcoin::Amount::from_sat(change_value);
         } else if let Some(last_output) = outputs.iter_mut().last() {
@@ -3378,7 +3543,8 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         };
         
         let prefetched_for_reveal = build_prefetched_txouts_map(params)?;
-        let (mut psbt, fee, estimated_vsize) = self.build_psbt_and_fee(selected_utxos, outputs, Some(runestone_script), params.fee_rate, Some(envelope), Some(commit_txout), prefetched_for_reveal.as_ref()).await?;
+        // Reveal/envelope path does not support Rebar (guarded in execute_full).
+        let (mut psbt, fee, estimated_vsize) = self.build_psbt_and_fee(selected_utxos, outputs, Some(runestone_script), params.fee_rate, Some(envelope), Some(commit_txout), prefetched_for_reveal.as_ref(), false, None).await?;
 
         let reveal_script = envelope.build_reveal_script();
         let (spend_info, _) = self.create_taproot_spend_info_for_envelope(envelope, commit_internal_key).await?;

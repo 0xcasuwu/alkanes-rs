@@ -1084,7 +1084,7 @@ impl WebProvider {
             };
 
             // Parse options (from_addresses, change_address, etc.)
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, split_transactions, prefetched_utxos, max_indexed_height) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, split_transactions, prefetched_utxos, max_indexed_height, use_rebar, rebar_tier) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -1135,6 +1135,18 @@ impl WebProvider {
                     .or_else(|| opts.get("maxIndexedHeight"))
                     .and_then(|v| v.as_u64());
 
+                // Rebar Shield private-relay opt-in. When set (and on mainnet),
+                // execute_full adds a Rebar payment output and submits via Rebar's
+                // /v1/rpc. See EnhancedExecuteParams::use_rebar / rebar_tier.
+                let use_rebar = opts.get("use_rebar")
+                    .or_else(|| opts.get("useRebar"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let rebar_tier: Option<u8> = opts.get("rebar_tier")
+                    .or_else(|| opts.get("rebarTier"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u8);
+
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                     opts.get("mine_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -1148,9 +1160,11 @@ impl WebProvider {
                     split_tx,
                     prefetched,
                     max_idx,
+                    use_rebar,
+                    rebar_tier,
                 )
             } else {
-                (false, false, true, false, None, None, None, Default::default(), false, false, Vec::new(), None)
+                (false, false, true, false, None, None, None, Default::default(), false, false, Vec::new(), None, false, None)
             };
 
             let params = EnhancedExecuteParams {
@@ -1172,6 +1186,8 @@ impl WebProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos,
                 max_indexed_height,
+                use_rebar,
+                rebar_tier,
             };
 
             provider.execute(params).await
@@ -1225,7 +1241,7 @@ impl WebProvider {
             };
 
             // Parse options
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, split_transactions, prefetched_utxos, max_indexed_height) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, split_transactions, prefetched_utxos, max_indexed_height, use_rebar, rebar_tier) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -1267,6 +1283,19 @@ impl WebProvider {
                     .or_else(|| opts.get("maxIndexedHeight"))
                     .and_then(|v| v.as_u64());
 
+                // Rebar Shield private-relay opt-in (the FIRE bond sniper passes
+                // these via options_json). On mainnet, execute_full adds the Rebar
+                // payment output (PRE-sign) and submits via Rebar's /v1/rpc instead
+                // of the normal broadcast. See EnhancedExecuteParams::use_rebar.
+                let use_rebar = opts.get("use_rebar")
+                    .or_else(|| opts.get("useRebar"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let rebar_tier: Option<u8> = opts.get("rebar_tier")
+                    .or_else(|| opts.get("rebarTier"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u8);
+
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                     opts.get("mine_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -1280,9 +1309,11 @@ impl WebProvider {
                     split_tx,
                     prefetched,
                     max_idx,
+                    use_rebar,
+                    rebar_tier,
                 )
             } else {
-                (false, false, true, false, None, None, None, Default::default(), false, false, Vec::new(), None)
+                (false, false, true, false, None, None, None, Default::default(), false, false, Vec::new(), None, false, None)
             };
 
             let params = EnhancedExecuteParams {
@@ -1304,6 +1335,8 @@ impl WebProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos,
                 max_indexed_height,
+                use_rebar,
+                rebar_tier,
             };
 
             // Use execute_full to handle the complete flow internally
@@ -9720,6 +9753,8 @@ impl DeezelProvider for WebProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos: Vec::new(),
                 max_indexed_height: None,
+                use_rebar: false,
+                rebar_tier: None,
         };
 
         match executor.execute(params).await? {
@@ -9763,6 +9798,8 @@ impl DeezelProvider for WebProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos: Vec::new(),
                 max_indexed_height: None,
+                use_rebar: false,
+                rebar_tier: None,
         };
 
         match executor.execute(params).await? {

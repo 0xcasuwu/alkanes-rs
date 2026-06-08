@@ -123,6 +123,8 @@ pub async fn init_pool(
         known_pending_tx_hexes: Vec::new(),
         prefetched_utxos: Vec::new(),
     max_indexed_height: None,
+        use_rebar: false,
+        rebar_tier: None,
     };
     
     // Execute
@@ -226,6 +228,8 @@ pub async fn execute_swap(
         known_pending_tx_hexes: Vec::new(),
         prefetched_utxos: Vec::new(),
     max_indexed_height: None,
+        use_rebar: false,
+        rebar_tier: None,
     };
     
     // Execute

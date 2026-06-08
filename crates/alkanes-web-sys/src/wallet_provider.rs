@@ -2008,6 +2008,8 @@ impl DeezelProvider for BrowserWalletProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos: Vec::new(),
         max_indexed_height: None,
+        use_rebar: false,
+        rebar_tier: None,
         };
 
         match executor.execute(params).await? {
@@ -2053,6 +2055,8 @@ impl DeezelProvider for BrowserWalletProvider {
                 known_pending_tx_hexes: Vec::new(),
                 prefetched_utxos: Vec::new(),
         max_indexed_height: None,
+        use_rebar: false,
+        rebar_tier: None,
         };
 
         match executor.execute(params).await? {
